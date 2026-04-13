@@ -20,6 +20,8 @@ OmniVoice is a state-of-the-art massively multilingual zero-shot text-to-speech 
 
 **Contents**: [Key Features](#key-features) | [Installation](#installation) | [Quick Start](#quick-start) | [Python API](#python-api) | [Command-Line Tools](#command-line-tools) | [Training & Evaluation](#training--evaluation) | [Discussion](#discussion--communication) | [Citation](#citation)
 
+TODO: edit capability
+
 ## Key Features
 
 - **600+ Languages Supported**: The broadest language coverage among zero-shot TTS models ([full list](docs/languages.md)).
