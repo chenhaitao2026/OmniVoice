@@ -233,6 +233,7 @@ class GenerationTask:
 class OmniVoiceModelOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
+    past_key_values: Optional[Any] = None
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +252,9 @@ class OmniVoiceConfig(PretrainedConfig):
         num_audio_codebook: int = 8,
         audio_codebook_weights: Optional[list[float]] = None,
         llm_config: Optional[Union[dict, PretrainedConfig]] = None,
+        block_size: int = 0,
+        audio_eos_id: Optional[int] = None,
+        block_steps: int = 8,
         **kwargs,
     ):
         if isinstance(llm_config, dict):
@@ -265,6 +269,10 @@ class OmniVoiceConfig(PretrainedConfig):
         if audio_codebook_weights is None:
             audio_codebook_weights = [8, 8, 6, 6, 4, 4, 2, 2]
         self.audio_codebook_weights = audio_codebook_weights
+        # Luna-TTS Realtime. block_size == 0 keeps the original bidirectional model.
+        self.block_size = block_size
+        self.audio_eos_id = audio_eos_id
+        self.block_steps = block_steps
 
 
 def _resolve_model_path(name_or_path: str) -> str:
@@ -497,10 +505,44 @@ class OmniVoice(PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         document_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        block_ids: Optional[torch.Tensor] = None,
+        stream_ids: Optional[torch.Tensor] = None,
+        loss_weight: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Any] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ):
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
-        if attention_mask is None and document_ids is not None:
+        if attention_mask is None and block_ids is not None:
+            from omnivoice.models.block_diffusion import (
+                attention_mask_for_impl,
+                build_block_attention_mask,
+                build_flex_block_mask,
+            )
+
+            impl = self.llm.config._attn_implementation
+            if "flex" in impl:
+                if not _flex_attention_available:
+                    raise RuntimeError(
+                        "flex_attention is not available. Set "
+                        '"attn_implementation": "sdpa" for block-causal training.'
+                    )
+                attention_mask = build_flex_block_mask(
+                    block_ids, stream_ids, document_ids, inputs_embeds.device
+                )
+            else:
+                attention_mask = build_block_attention_mask(
+                    block_ids.to(inputs_embeds.device),
+                    stream_ids.to(inputs_embeds.device),
+                    None
+                    if document_ids is None
+                    else document_ids.to(inputs_embeds.device),
+                )
+                attention_mask = attention_mask_for_impl(
+                    attention_mask, impl, inputs_embeds.dtype
+                )
+        elif attention_mask is None and document_ids is not None:
             if not _flex_attention_available:
                 raise RuntimeError(
                     "flex_attention is not available in the current environment. "
@@ -524,6 +566,9 @@ class OmniVoice(PreTrainedModel):
             attention_mask=attention_mask,
             return_dict=True,
             position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
         )
         hidden_states = llm_outputs[0]
 
@@ -561,11 +606,18 @@ class OmniVoice(PreTrainedModel):
             weights = torch.tensor(
                 self.normalized_audio_codebook_weights, device=audio_logits.device
             )
+            if loss_weight is not None:
+                token_weight = loss_weight.to(per_token_loss.dtype).unsqueeze(1)
+                weighted_valid = valid_mask * token_weight
+                layer_means = (per_token_loss * weighted_valid).sum(
+                    dim=(0, 2)
+                ) / weighted_valid.sum(dim=(0, 2)).clamp(min=1.0)
             loss = (layer_means * weights).sum()
 
         return OmniVoiceModelOutput(
             loss=loss,
             logits=audio_logits,
+            past_key_values=getattr(llm_outputs, "past_key_values", None),
         )
 
     def supported_language_ids(self) -> set[str]:
@@ -725,6 +777,160 @@ class OmniVoice(PreTrainedModel):
             )
 
         return generated_audios
+
+    @torch.inference_mode()
+    def generate_realtime(
+        self,
+        text: Union[str, list[str]],
+        language: Union[str, list[str], None] = None,
+        ref_text: Union[str, list[str], None] = None,
+        ref_audio: Union[
+            str,
+            list[str],
+            tuple[torch.Tensor, int],
+            list[tuple[torch.Tensor, int]],
+            None,
+        ] = None,
+        voice_clone_prompt: Union[VoiceClonePrompt, list[VoiceClonePrompt], None] = None,
+        instruct: Union[str, list[str], None] = None,
+        generation_config: Optional[OmniVoiceGenerationConfig] = None,
+        normalize_text: bool = False,
+        max_duration: float = 60.0,
+        stream: bool = False,
+        **kwargs,
+    ):
+        """Stream speech in fixed codec blocks, Luna-TTS Realtime style.
+
+        Unlike :meth:`generate`, the target length is not predicted up front.
+        The model denoises one block (``config.block_size`` frames, 1.28 s at
+        25 Hz) at a time, commits it to the KV cache, and stops when it emits
+        the audio EOS token or when ``max_duration`` is reached.
+
+        Args:
+            stream: If True, return a generator of 1-D numpy chunks for a single
+                text. Batch streaming is not supported. If False, return a list
+                of waveforms, same as :meth:`generate`.
+            max_duration: Serving cap in seconds. Generation still ends early
+                on EOS.
+            **kwargs: Same decoding fields as :meth:`generate`. ``num_step``
+                defaults to ``config.block_steps`` (8) rather than 32.
+        """
+        if self.text_tokenizer is None:
+            raise RuntimeError(
+                "Text tokenizer is not loaded. Use OmniVoice.from_pretrained()."
+            )
+        if self.duration_estimator is None:
+            self.duration_estimator = RuleDurationEstimator()
+
+        user_set_steps = generation_config is not None or "num_step" in kwargs
+        gen_config = (
+            generation_config
+            if generation_config is not None
+            else OmniVoiceGenerationConfig.from_dict(kwargs)
+        )
+        if not user_set_steps:
+            gen_config.num_step = int(getattr(self.config, "block_steps", 8) or 8)
+
+        self.eval()
+        task = self._preprocess_all(
+            text=text,
+            language=language,
+            ref_text=ref_text,
+            ref_audio=ref_audio,
+            voice_clone_prompt=voice_clone_prompt,
+            instruct=instruct,
+            preprocess_prompt=gen_config.preprocess_prompt,
+            speed=None,
+            duration=None,
+            normalize_text=normalize_text,
+        )
+        frame_rate = 25.0
+        if self.audio_tokenizer is not None:
+            frame_rate = float(self.audio_tokenizer.config.frame_rate)
+
+        if stream:
+            if task.batch_size != 1:
+                raise ValueError("stream=True only supports a single text.")
+            return self._stream_realtime_audio(task, 0, gen_config, max_duration, frame_rate)
+
+        if self.audio_tokenizer is None:
+            raise RuntimeError(
+                "Audio tokenizer is not loaded. Use OmniVoice.from_pretrained()."
+            )
+        audios = []
+        for i in range(task.batch_size):
+            tokens = self._realtime_tokens(task, i, gen_config, max_duration, frame_rate)
+            if tokens.shape[-1] == 0:
+                logger.warning("Realtime generation produced no speech frames.")
+                audios.append(
+                    np.zeros(int(0.1 * self.sampling_rate), dtype=np.float32)
+                )
+                continue
+            audios.append(
+                self._decode_and_post_process(tokens, task.ref_rms[i], gen_config)
+            )
+        return audios
+
+    def _realtime_tokens(self, task, index, gen_config, max_duration, frame_rate):
+        from omnivoice.models.block_diffusion import iter_realtime_blocks
+
+        pieces = list(
+            iter_realtime_blocks(
+                self,
+                text=task.texts[index],
+                ref_text=task.ref_texts[index],
+                ref_audio_tokens=task.ref_audio_tokens[index],
+                lang=task.langs[index],
+                instruct=task.instructs[index],
+                gen_config=gen_config,
+                max_duration=max_duration,
+                frame_rate=frame_rate,
+            )
+        )
+        if not pieces:
+            return torch.empty(
+                self.config.num_audio_codebook, 0, dtype=torch.long, device=self.device
+            )
+        return torch.cat(pieces, dim=-1)
+
+    def _stream_realtime_audio(self, task, index, gen_config, max_duration, frame_rate):
+        from omnivoice.models.block_diffusion import iter_realtime_blocks
+
+        if self.audio_tokenizer is None:
+            raise RuntimeError(
+                "Audio tokenizer is not loaded. Use OmniVoice.from_pretrained()."
+            )
+
+        def _chunks():
+            committed = []
+            emitted = 0
+            for block in iter_realtime_blocks(
+                self,
+                text=task.texts[index],
+                ref_text=task.ref_texts[index],
+                ref_audio_tokens=task.ref_audio_tokens[index],
+                lang=task.langs[index],
+                instruct=task.instructs[index],
+                gen_config=gen_config,
+                max_duration=max_duration,
+                frame_rate=frame_rate,
+            ):
+                committed.append(block)
+                tokens = torch.cat(committed, dim=-1)
+                waveform = (
+                    self.audio_tokenizer.decode(
+                        tokens.to(self.audio_tokenizer.device).unsqueeze(0)
+                    )
+                    .audio_values[0]
+                    .cpu()
+                    .numpy()
+                    .squeeze()
+                )
+                if waveform.shape[-1] > emitted:
+                    yield waveform[emitted:]
+                    emitted = waveform.shape[-1]
+
+        return _chunks()
 
     def create_voice_clone_prompt(
         self,

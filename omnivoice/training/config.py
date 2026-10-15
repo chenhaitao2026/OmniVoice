@@ -51,6 +51,13 @@ class TrainingConfig:
     instruct_ratio: float = 1.0
     only_instruct_ratio: float = 0.5
 
+    # Luna-TTS Realtime block adaptation. Leave block_causal false to keep
+    # the original fully bidirectional OmniVoice objective.
+    block_causal: bool = False
+    block_size: int = 32
+    block_steps: int = 8
+    audio_eos_id: int = 1025
+
     # Init settings
     resume_from_checkpoint: Optional[str] = None
     init_from_checkpoint: Optional[str] = None

@@ -38,6 +38,10 @@ By default, training uses `flex_attention`, which requires PyTorch ≥ 2.5 and a
 
 `"sdpa"` uses PyTorch's built-in scaled dot-product attention and works on a wider range of hardware.
 
+## Luna-TTS Realtime
+
+Block-causal streaming adaptation (32-frame blocks, KV cache, learned EOS) is a continual-training stage on top of a bidirectional OmniVoice checkpoint. See [luna_realtime.md](luna_realtime.md) and [examples/config/train_config_luna_realtime.json](../examples/config/train_config_luna_realtime.json).
+
 The following fields only apply when `attn_implementation != "flex_attention"`:
 
 | Field | Description | Default |

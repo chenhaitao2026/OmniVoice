@@ -88,8 +88,21 @@ def get_parser() -> argparse.ArgumentParser:
         help="Language name (e.g. 'English') or code (e.g. 'en').",
     )
     # Generation parameters
-    parser.add_argument("--num_step", type=int, default=32)
+    parser.add_argument("--num_step", type=int, default=None)
     parser.add_argument("--guidance_scale", type=float, default=2.0)
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help="Use Luna-TTS Realtime block-causal streaming generation. "
+        "Requires a checkpoint trained with block_causal=true.",
+    )
+    parser.add_argument(
+        "--max_duration",
+        type=float,
+        default=60.0,
+        help="Maximum generated duration in seconds for --realtime. "
+        "Generation still stops early on the learned EOS token.",
+    )
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument(
         "--duration",
@@ -137,16 +150,13 @@ def main():
         model = load_lora_adapter(model, args.lora_adapter)
 
     logging.info(f"Generating audio for: {args.text[:80]}...")
-    audios = model.generate(
+    gen_kwargs = dict(
         text=args.text,
         language=args.language,
         ref_audio=args.ref_audio,
         ref_text=args.ref_text,
         instruct=args.instruct,
-        duration=args.duration,
-        num_step=args.num_step,
         guidance_scale=args.guidance_scale,
-        speed=args.speed,
         t_shift=args.t_shift,
         denoise=args.denoise,
         postprocess_output=args.postprocess_output,
@@ -154,6 +164,27 @@ def main():
         position_temperature=args.position_temperature,
         class_temperature=args.class_temperature,
     )
+    if args.num_step is not None:
+        gen_kwargs["num_step"] = args.num_step
+    if args.realtime:
+        logging.info(
+            "Realtime mode: block-causal generation, max_duration=%.1fs",
+            args.duration if args.duration is not None else args.max_duration,
+        )
+        audios = model.generate_realtime(
+            **gen_kwargs,
+            max_duration=args.duration
+            if args.duration is not None
+            else args.max_duration,
+        )
+    else:
+        if args.num_step is None:
+            gen_kwargs["num_step"] = 32
+        audios = model.generate(
+            **gen_kwargs,
+            duration=args.duration,
+            speed=args.speed,
+        )
 
     sf.write(args.output, audios[0], model.sampling_rate)
     logging.info(f"Saved to {args.output}")

@@ -126,7 +126,20 @@ def build_model_and_tokenizer(
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.eos_token_id = tokenizer.eos_token_id
 
-    # 5. Wrap with LoRA adapters (optional)
+    # 5. Luna-TTS Realtime: grow the audio vocab with an EOS id and record the
+    # block geometry on the config so the saved checkpoint can stream.
+    if config.block_causal:
+        from omnivoice.models.block_diffusion import apply_block_causal_adaptation
+
+        apply_block_causal_adaptation(model, config)
+        logger.info(
+            "Block-causal adaptation enabled (block_size=%d, eos_id=%d, steps/block=%d).",
+            config.block_size,
+            config.audio_eos_id,
+            config.block_steps,
+        )
+
+    # 6. Wrap with LoRA adapters (optional)
     if config.use_lora:
         model = _apply_lora(model, config)
 
@@ -171,18 +184,36 @@ def build_dataloaders(
     """
     logger.info("Initializing Data Readers...")
 
-    processor = OmniVoiceSampleProcessor(
-        text_tokenizer=tokenizer,
-        num_channels=config.num_audio_codebook,
-        audio_mask_id=config.audio_mask_id,
-        prompt_ratio_range=config.prompt_ratio_range,
-        mask_ratio_range=config.mask_ratio_range,
-        drop_cond_ratio=config.drop_cond_ratio,
-        language_ratio=config.language_ratio,
-        use_pinyin_ratio=config.use_pinyin_ratio,
-        instruct_ratio=config.instruct_ratio,
-        only_instruct_ratio=config.only_instruct_ratio,
-    )
+    if config.block_causal:
+        from omnivoice.data.block_processor import BlockDiffusionSampleProcessor
+
+        processor = BlockDiffusionSampleProcessor(
+            text_tokenizer=tokenizer,
+            num_channels=config.num_audio_codebook,
+            audio_mask_id=config.audio_mask_id,
+            audio_eos_id=config.audio_eos_id,
+            block_size=config.block_size,
+            prompt_ratio_range=config.prompt_ratio_range,
+            mask_ratio_range=config.mask_ratio_range,
+            drop_cond_ratio=config.drop_cond_ratio,
+            language_ratio=config.language_ratio,
+            use_pinyin_ratio=config.use_pinyin_ratio,
+            instruct_ratio=config.instruct_ratio,
+            only_instruct_ratio=config.only_instruct_ratio,
+        )
+    else:
+        processor = OmniVoiceSampleProcessor(
+            text_tokenizer=tokenizer,
+            num_channels=config.num_audio_codebook,
+            audio_mask_id=config.audio_mask_id,
+            prompt_ratio_range=config.prompt_ratio_range,
+            mask_ratio_range=config.mask_ratio_range,
+            drop_cond_ratio=config.drop_cond_ratio,
+            language_ratio=config.language_ratio,
+            use_pinyin_ratio=config.use_pinyin_ratio,
+            instruct_ratio=config.instruct_ratio,
+            only_instruct_ratio=config.only_instruct_ratio,
+        )
 
     train_manifests, dev_manifests = prepare_data_manifests_from_json(
         config.data_config
@@ -191,11 +222,25 @@ def build_dataloaders(
 
     use_packing = config.attn_implementation == "flex_attention"
 
+    if config.block_causal:
+        from omnivoice.data.block_processor import (
+            BlockPackingDataCollator,
+            BlockPaddingDataCollator,
+        )
+
+        collate_cls = (
+            BlockPackingDataCollator if use_packing else BlockPaddingDataCollator
+        )
+        collate_fn = collate_cls(processor, config.batch_tokens)
+    elif use_packing:
+        collate_fn = PackingDataCollator(processor, config.batch_tokens)
+    else:
+        collate_fn = PaddingDataCollator(processor, config.batch_tokens)
+
     if use_packing:
         train_dataset = PackingIterableDataset(
             raw_train_ds, processor, config.batch_tokens
         )
-        collate_fn = PackingDataCollator(processor, config.batch_tokens)
     else:
         train_dataset = StreamLengthGroupDataset(
             raw_train_ds,
@@ -206,7 +251,6 @@ def build_dataloaders(
             processor=processor,
             length_fn=lambda s: s["length"],
         )
-        collate_fn = PaddingDataCollator(processor, config.batch_tokens)
 
     logger.info(
         "Using %s (attn_implementation=%s)",
