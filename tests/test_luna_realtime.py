@@ -163,6 +163,28 @@ class RealtimeSmokeTest(unittest.TestCase):
         self.assertEqual(int(model.codebook_layer_offsets[1]), 9)
         self.assertEqual(model.config.audio_vocab_size, 9)
 
+    def test_cfg_does_not_collapse_onto_eos(self):
+        model = _tiny_model(vocab=16, mask_id=14, codebooks=2)
+        model.config.audio_eos_id = 15
+        # Conditional model prefers speech token 3, with a moderate EOS logit.
+        # Unconditional model also prefers 3, but assigns EOS a large negative
+        # logit — the gap that used to make guidance emit EOS immediately.
+        cond = torch.full((1, 2, 4, 16), -2.0)
+        uncond = torch.full((1, 2, 4, 16), -2.0)
+        cond[..., 3] = 4.0
+        cond[..., 15] = 1.0
+        uncond[..., 3] = 4.0
+        uncond[..., 15] = -8.0
+        gen = OmniVoiceGenerationConfig(guidance_scale=2.0, class_temperature=0.0)
+        pred, _ = model._predict_tokens_with_scoring(cond, uncond, gen)
+        self.assertTrue(torch.equal(pred, torch.full_like(pred, 3)))
+
+        # A conditional model that is actually done should still be allowed to stop.
+        cond[..., 15] = 8.0
+        cond[..., 3] = 0.0
+        pred, _ = model._predict_tokens_with_scoring(cond, uncond, gen)
+        self.assertTrue(torch.equal(pred, torch.full_like(pred, 15)))
+
     def test_one_block_with_and_without_cfg(self):
         model = _tiny_model(vocab=16, mask_id=14, codebooks=2)
         model.config.block_size = 4

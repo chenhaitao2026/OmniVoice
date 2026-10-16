@@ -1636,6 +1636,20 @@ class OmniVoice(PreTrainedModel):
         if gen_config.guidance_scale != 0:
             c_log_probs = F.log_softmax(c_logits, dim=-1)
             u_log_probs = F.log_softmax(u_logits, dim=-1)
+            # EOS is a stopping decision, not a content token. Log-prob CFG
+            # otherwise latches onto it: the text-conditional model assigns
+            # it non-trivial mass and the unconditional model (especially
+            # with an empty prompt) assigns it almost none, so the gap
+            # explodes to p(EOS)=1 and the utterance ends with no speech.
+            # Keep the conditional EOS score and guide only the speech codes.
+            # The mask id is never sampled; neutralizing it too stops it from
+            # swallowing the softmax and flattening confidence scores.
+            eos_id = getattr(self.config, "audio_eos_id", None)
+            if eos_id is not None:
+                u_log_probs[..., eos_id] = c_log_probs[..., eos_id]
+                u_log_probs[..., self.config.audio_mask_id] = c_log_probs[
+                    ..., self.config.audio_mask_id
+                ]
             log_probs = torch.log_softmax(
                 c_log_probs + gen_config.guidance_scale * (c_log_probs - u_log_probs),
                 dim=-1,
