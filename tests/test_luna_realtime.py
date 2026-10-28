@@ -18,6 +18,7 @@ from omnivoice.models.block_diffusion import (
     STREAM_CLEAN,
     STREAM_NOISY,
     _BatchedCFGRunner,
+    _SeparateCFGRunner,
     build_block_attention_mask,
     iter_realtime_blocks,
     resize_audio_vocab,
@@ -242,6 +243,77 @@ class RealtimeSmokeTest(unittest.TestCase):
         self.assertTrue(visible_uncond[:, :lu].all())
         self.assertFalse(visible_uncond[:, lu:lc].any())
         self.assertTrue(visible_uncond[:, lc : lc + 2 * block].all())
+
+    def test_min_frames_blocks_early_eos(self):
+        from unittest.mock import patch
+
+        model = _tiny_model(vocab=16, mask_id=14, codebooks=2)
+        model.config.block_size = 4
+        model.config.audio_eos_id = 15
+        model.text_tokenizer = _FakeTokenizer()
+
+        def always_eos_step(_runner, _tokens):
+            # Every position of every codebook prefers EOS (15), with token 3
+            # as the fallback once EOS is masked out.
+            logits = torch.full((1, 2, 4, 16), -2.0)
+            logits[..., 3] = 0.0
+            logits[..., 15] = 4.0
+            return logits, logits
+
+        def frames(min_frames, guidance_scale):
+            gen = OmniVoiceGenerationConfig(
+                num_step=1,
+                guidance_scale=guidance_scale,
+                position_temperature=0.0,
+                min_frames=min_frames,
+                # Keep the separate runner so the patched step below is the one
+                # actually used, with and without CFG.
+                realtime_batch_cfg=False,
+            )
+            with patch.object(_SeparateCFGRunner, "step", always_eos_step):
+                blocks = list(
+                    iter_realtime_blocks(
+                        model,
+                        text="hello",
+                        ref_text=None,
+                        ref_audio_tokens=None,
+                        lang="en",
+                        instruct=None,
+                        gen_config=gen,
+                        max_duration=0.4,
+                        frame_rate=25.0,
+                    )
+                )
+            return sum(block.shape[-1] for block in blocks)
+
+        for scale in (0.0, 2.0):
+            # Without the floor the first block is pure EOS: no speech is emitted.
+            self.assertEqual(frames(0, scale), 0)
+            # With the floor, EOS can only appear after six committed frames.
+            self.assertEqual(frames(6, scale), 6)
+        # The floor is on by default (5 frames).
+        self.assertEqual(OmniVoiceGenerationConfig().min_frames, 5)
+
+    def test_eos_suppression_is_nan_free_under_cfg(self):
+        model = _tiny_model(vocab=16, mask_id=14, codebooks=2)
+        model.config.audio_eos_id = 15
+        cond = torch.full((1, 2, 4, 16), -2.0)
+        uncond = torch.full((1, 2, 4, 16), -2.0)
+        cond[..., 3] = 0.0
+        cond[..., 15] = 8.0
+        uncond[..., 3] = 0.0
+        uncond[..., 15] = -8.0
+        gen = OmniVoiceGenerationConfig(guidance_scale=2.0, class_temperature=0.0)
+        eos_allowed = torch.tensor([False, False, True, True])
+        pred, scores = model._predict_tokens_with_scoring(
+            cond, uncond, gen, eos_allowed=eos_allowed
+        )
+        # Suppression happens after the CFG combine; -inf must not leak into
+        # c - u and turn the row into NaN.
+        self.assertFalse(torch.isnan(scores).any())
+        self.assertTrue(torch.isfinite(scores).all())
+        self.assertTrue((pred[..., :2] == 3).all())
+        self.assertTrue((pred[..., 2:] == 15).all())
 
     def test_stream_crossfade_removes_block_seam(self):
         import numpy as np

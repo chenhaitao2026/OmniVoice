@@ -363,6 +363,7 @@ def synthesize(
         postprocess_output=args.postprocess_output,
         realtime_compile=args.realtime_compile,
         realtime_batch_cfg=args.realtime_batch_cfg,
+        min_frames=args.min_frames,
     )
     if args.num_step is not None:
         gen_kwargs["num_step"] = args.num_step
@@ -558,6 +559,15 @@ def get_parser() -> argparse.ArgumentParser:
         help="Commit blocks internally but decode the whole utterance at the end.",
     )
     parser.add_argument("--max-duration", type=float, default=30.0)
+    parser.add_argument(
+        "--min-frames",
+        type=int,
+        default=5,
+        help="Minimum codec frames to emit before the learned EOS is allowed "
+        "(25 frames = 1 s). Prevents a spurious early EOS from truncating the "
+        "utterance to near silence. Set 0 to disable the floor, e.g. when "
+        "comparing CER against a run without it.",
+    )
     parser.add_argument(
         "--realtime-compile",
         action="store_true",
@@ -763,6 +773,7 @@ def main() -> int:
         dataset=str(dataset),
         streaming=args.stream,
         max_duration=args.max_duration,
+        min_frames=args.min_frames,
         num_step=args.num_step,
         guidance_scale=args.guidance_scale,
         t_shift=args.t_shift,

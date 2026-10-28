@@ -648,6 +648,8 @@ def iter_realtime_blocks(
     """Yield each committed speech block as ``[C, T]`` tokens, EOS stripped.
 
     Stops on the learned EOS frame or on ``max_duration``, whichever comes first.
+    ``gen_config.min_frames`` raises the earliest stopping point: EOS is masked
+    out until that many frames have been committed.
     """
     block_size = int(getattr(model.config, "block_size", 0) or 0)
     eos_id = getattr(model.config, "audio_eos_id", None)
@@ -697,6 +699,18 @@ def iter_realtime_blocks(
 
     max_frames = max(block_size, int(max_duration * frame_rate))
     max_blocks = math.ceil(max_frames / block_size)
+
+    # Floor on emitted frames. An EOS predicted in the first few positions would
+    # otherwise commit little or no speech, yielding a near-silent fragment.
+    min_frames = max(0, int(getattr(gen_config, "min_frames", 5) or 0))
+    if min_frames > max_frames:
+        logger.warning(
+            "min_frames=%d exceeds max_duration=%.1fs (%d frames); clamping.",
+            min_frames,
+            max_duration,
+            max_frames,
+        )
+        min_frames = max_frames
 
     batch_cfg = bool(getattr(gen_config, "realtime_batch_cfg", True))
     compile_steps = bool(getattr(gen_config, "realtime_compile", False))
@@ -753,10 +767,24 @@ def iter_realtime_blocks(
         for step, k in enumerate(counts):
             k = min(k, remaining)
             cond_logits, uncond_logits = runner.step(tokens)
+            eos_allowed = None
+            if produced < min_frames:
+                # Suppress the stopping decision until the floor is reached.
+                # EOS is a per-frame prediction, so only the positions that
+                # would fall below min_frames are masked. This is applied after
+                # the CFG combine (see _predict_tokens_with_scoring): writing
+                # -inf into the raw logits here would make c - u equal
+                # -inf - (-inf) = NaN and poison the whole row.
+                first_allowed = min(block_size, min_frames - produced)
+                eos_allowed = torch.ones(
+                    block_size, dtype=torch.bool, device=device
+                )
+                eos_allowed[:first_allowed] = False
             pred, scores = model._predict_tokens_with_scoring(
                 cond_logits[:, :, :block_size],
                 uncond_logits[:, :, :block_size],
                 gen_config,
+                eos_allowed=eos_allowed,
             )
             scores = scores - layer_ids * gen_config.layer_penalty_factor
             tokens = _commit_schedule_step(

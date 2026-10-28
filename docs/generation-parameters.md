@@ -68,3 +68,11 @@ To support stable long-form speech generation with low VRAM consumption, the tex
 |---|---|---|---|
 | `audio_chunk_duration` | float | 15.0 | Target chunk duration (seconds) when splitting long text. |
 | `audio_chunk_threshold` | float | 30.0 | Estimated audio duration (seconds) above which chunking is activated. |
+
+## Realtime (`generate_realtime`)
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `min_frames` | int | 5 | Minimum number of codec frames to emit before the learned EOS is allowed. EOS logits are masked below this boundary, preventing a spurious early EOS from truncating the output to a near-silent fragment. 25 frames = 1 s at 25 Hz; 0 disables the floor. |
+| `max_duration` | float | 60.0 | Serving cap in seconds. Generation normally ends earlier on EOS. |
+

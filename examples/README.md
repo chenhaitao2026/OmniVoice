@@ -139,6 +139,9 @@ python examples/test_luna_realtime_minimax.py --limit 5
 
 # Fast path: batch the CFG streams and capture each step as a CUDA graph
 python examples/test_luna_realtime_minimax.py --limit 5 --realtime-compile
+
+# Ablation: disable the minimum-frame floor (default is 5 frames)
+python examples/test_luna_realtime_minimax.py --min-frames 0
 ```
 
 The first sample with `--realtime-compile` includes a one-off compile/capture

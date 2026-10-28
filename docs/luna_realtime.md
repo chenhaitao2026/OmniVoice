@@ -68,7 +68,11 @@ omnivoice-infer --model exp/luna_tts_realtime/checkpoint-20000 \
 `--num_step` is the number of refinement steps inside each block, not the
 number of blocks. Omit it to use `block_steps` from the checkpoint (8).
 `--max_duration` (or `--duration`) only caps the utterance; the model stops
-itself on EOS.
+itself on EOS. If the checkpoint predicts EOS at the very start — producing a
+near-silent fragment — `--min_frames` sets a floor: EOS logits are masked out
+until that many codec frames have been committed (25 frames = 1 s). The same
+option is available as `min_frames` in `generate_realtime()` and in
+`OmniVoiceGenerationConfig`; the default is 5 frames, and 0 disables the floor.
 
 ```python
 from omnivoice import OmniVoice
@@ -80,6 +84,7 @@ audio = model.generate_realtime(
     ref_text="Reference transcript.",
     num_step=8,
     max_duration=30,
+    min_frames=25,
 )
 # Incremental delivery. Each chunk is the new tail of a cumulative codec decode,
 # so concatenation equals a single full decode.

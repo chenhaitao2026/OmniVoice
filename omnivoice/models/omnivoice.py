@@ -194,6 +194,11 @@ class OmniVoiceGenerationConfig:
     # makes streaming decode O(T) instead of re-decoding the whole prefix every
     # block; 0 falls back to the cumulative re-decode.
     stream_decode_context: float = 2.56
+    # Realtime only: minimum number of codec frames to emit before EOS is
+    # allowed. EOS logits are masked out at earlier frame positions, so a
+    # spurious start-of-utterance EOS cannot truncate the utterance to a
+    # near-silent fragment. 0 disables the floor.
+    min_frames: int = 5
     # Realtime decoding. With guidance_scale != 0 the two CFG streams are
     # batched into one forward by default (same GPU cost as one stream at these
     # sequence lengths). realtime_compile additionally captures each denoising
@@ -810,6 +815,7 @@ class OmniVoice(PreTrainedModel):
         generation_config: Optional[OmniVoiceGenerationConfig] = None,
         normalize_text: bool = False,
         max_duration: float = 60.0,
+        min_frames: Optional[int] = None,
         stream: bool = False,
         **kwargs,
     ):
@@ -829,6 +835,12 @@ class OmniVoice(PreTrainedModel):
                 False, return a list of waveforms, same as :meth:`generate`.
             max_duration: Serving cap in seconds. Generation still ends early
                 on EOS.
+            min_frames: Optional lower bound on emitted codec frames. Until this
+                many frames have been committed, EOS logits are suppressed, so a
+                spuriously early EOS cannot cut the utterance to near silence.
+                Overrides ``generation_config.min_frames`` when not ``None``.
+                ``None`` (default) keeps the value from the generation config
+                (5 frames unless set there).
             **kwargs: Same decoding fields as :meth:`generate`. ``num_step``
                 defaults to ``config.block_steps`` (8) rather than 32. Set
                 ``stream_crossfade_duration`` (seconds, default 0.08) to tune
@@ -855,6 +867,8 @@ class OmniVoice(PreTrainedModel):
         )
         if not user_set_steps:
             gen_config.num_step = int(getattr(self.config, "block_steps", 8) or 8)
+        if min_frames is not None:
+            gen_config.min_frames = int(min_frames)
 
         self.eval()
         task = self._preprocess_all(
@@ -1693,7 +1707,19 @@ class OmniVoice(PreTrainedModel):
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
 
-    def _predict_tokens_with_scoring(self, c_logits, u_logits, gen_config):
+    def _predict_tokens_with_scoring(
+        self, c_logits, u_logits, gen_config, eos_allowed=None
+    ):
+        """Predict one token per position/codebook and its confidence.
+
+        ``eos_allowed`` (optional, shape ``[T]``) disables the audio EOS at
+        selected frame positions. It is applied to ``log_probs`` *after* the CFG
+        combine: masking EOS in the raw logits first would turn
+        ``c_log_probs - u_log_probs`` into ``-inf - (-inf) = NaN`` whenever
+        classifier-free guidance is active. Attention mask positions do not
+        affect the confidence of the remaining tokens, so the unmasking
+        schedule is left untouched.
+        """
         if gen_config.guidance_scale != 0:
             c_log_probs = F.log_softmax(c_logits, dim=-1)
             u_log_probs = F.log_softmax(u_logits, dim=-1)
@@ -1719,6 +1745,17 @@ class OmniVoice(PreTrainedModel):
             log_probs = F.log_softmax(c_logits, dim=-1)
 
         log_probs[..., self.config.audio_mask_id] = -float("inf")
+
+        if eos_allowed is not None:
+            eos_id = getattr(self.config, "audio_eos_id", None)
+            if eos_id is None:
+                raise ValueError(
+                    "eos_allowed requires config.audio_eos_id to be set."
+                )
+            allowed = eos_allowed.to(device=log_probs.device, dtype=torch.bool)
+            log_probs[..., eos_id] = log_probs[..., eos_id].masked_fill(
+                ~allowed, -float("inf")
+            )
 
         if gen_config.class_temperature > 0.0:
             filtered_probs = _filter_top_k(log_probs, ratio=0.1)

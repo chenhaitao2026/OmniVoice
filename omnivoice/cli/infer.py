@@ -104,6 +104,16 @@ def get_parser() -> argparse.ArgumentParser:
         "Generation still stops early on the learned EOS token.",
     )
     parser.add_argument(
+        "--min_frames",
+        type=int,
+        default=5,
+        help="Minimum number of codec frames to emit before EOS is allowed "
+        "(realtime only). Masks the EOS logits early in the utterance, so a "
+        "spurious start-of-utterance EOS cannot truncate the audio to near "
+        "silence. 25 frames = 1 s at the default 25 Hz frame rate. "
+        "0 disables the floor.",
+    )
+    parser.add_argument(
         "--realtime_compile",
         action="store_true",
         help="Capture each realtime denoising step as a CUDA graph. "
@@ -174,10 +184,13 @@ def main():
         gen_kwargs["num_step"] = args.num_step
     if args.realtime:
         logging.info(
-            "Realtime mode: block-causal generation, max_duration=%.1fs",
+            "Realtime mode: block-causal generation, max_duration=%.1fs, "
+            "min_frames=%d",
             args.duration if args.duration is not None else args.max_duration,
+            args.min_frames,
         )
         gen_kwargs["realtime_compile"] = args.realtime_compile
+        gen_kwargs["min_frames"] = args.min_frames
         audios = model.generate_realtime(
             **gen_kwargs,
             max_duration=args.duration
