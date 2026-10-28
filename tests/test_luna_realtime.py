@@ -212,6 +212,34 @@ class RealtimeSmokeTest(unittest.TestCase):
                 self.assertLessEqual(blocks[0].shape[1], 4)
                 self.assertFalse(torch.isin(blocks[0], torch.tensor(15)).any())
 
+    def test_stream_crossfade_removes_block_seam(self):
+        import numpy as np
+
+        from omnivoice.models.omnivoice import _crossfade_stream_chunks
+
+        block, fade = 10, 4
+        ref = np.linspace(0.0, 1.0, 4 * block, dtype=np.float32)
+
+        def decode(n_tokens):
+            # Full re-decode of the committed prefix. The trailing frames are
+            # increasingly wrong because this call lacks the next block's context.
+            wave = ref[: n_tokens * block].copy()
+            wave[-fade:] += 0.5 * np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            return wave
+
+        waves = [decode(n) for n in range(1, 5)]
+
+        smooth = np.concatenate(list(_crossfade_stream_chunks(waves, fade)))
+        raw = np.concatenate(list(_crossfade_stream_chunks(waves, 0)))
+
+        self.assertEqual(smooth.shape, ref.shape)
+        seam_jump = np.abs(np.diff(smooth)).max()
+        raw_jump = np.abs(np.diff(raw)).max()
+        # The legacy splice leaves a step of ~0.5 at each block edge; the
+        # cross-faded stream only has the signal's own slope.
+        self.assertGreater(raw_jump, 0.4)
+        self.assertLess(seam_jump, 0.2)
+
 
 if __name__ == "__main__":
     unittest.main()

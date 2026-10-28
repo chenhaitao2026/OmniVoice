@@ -187,6 +187,9 @@ class OmniVoiceGenerationConfig:
     audio_chunk_threshold: float = 30.0
     pad_duration: float = 0.1
     fade_duration: float = 0.1
+    # Streaming only: overlap kept between consecutive block decodes and
+    # cross-faded, so the block seam is not an abrupt splice.
+    stream_crossfade_duration: float = 0.08
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -808,12 +811,17 @@ class OmniVoice(PreTrainedModel):
 
         Args:
             stream: If True, return a generator of 1-D numpy chunks for a single
-                text. Batch streaming is not supported. If False, return a list
-                of waveforms, same as :meth:`generate`.
+                text. Batch streaming is not supported. Chunks are joined without
+                clicks: each block decode is held back by
+                ``generation_config.stream_crossfade_duration`` seconds and
+                cross-faded with the next decode, which sees more context. If
+                False, return a list of waveforms, same as :meth:`generate`.
             max_duration: Serving cap in seconds. Generation still ends early
                 on EOS.
             **kwargs: Same decoding fields as :meth:`generate`. ``num_step``
-                defaults to ``config.block_steps`` (8) rather than 32.
+                defaults to ``config.block_steps`` (8) rather than 32. Set
+                ``stream_crossfade_duration`` (seconds, default 0.08) to tune
+                the streaming overlap; 0 disables it.
         """
         if self.text_tokenizer is None:
             raise RuntimeError(
@@ -901,9 +909,9 @@ class OmniVoice(PreTrainedModel):
                 "Audio tokenizer is not loaded. Use OmniVoice.from_pretrained()."
             )
 
-        def _chunks():
-            committed = []
-            emitted = 0
+        committed = []
+
+        def _decoded_waveforms():
             for block in iter_realtime_blocks(
                 self,
                 text=task.texts[index],
@@ -917,7 +925,7 @@ class OmniVoice(PreTrainedModel):
             ):
                 committed.append(block)
                 tokens = torch.cat(committed, dim=-1)
-                waveform = (
+                yield (
                     self.audio_tokenizer.decode(
                         tokens.to(self.audio_tokenizer.device).unsqueeze(0)
                     )
@@ -926,9 +934,18 @@ class OmniVoice(PreTrainedModel):
                     .numpy()
                     .squeeze()
                 )
-                if waveform.shape[-1] > emitted:
-                    yield waveform[emitted:]
-                    emitted = waveform.shape[-1]
+
+        # The codec decoder is non-causal: the same frame is decoded with much
+        # less future context at the end of one call than in the next call.
+        # Holding back a short overlap and cross-fading removes the splice.
+        fade_n = int(gen_config.stream_crossfade_duration * self.sampling_rate)
+
+        def _chunks():
+            # generate_realtime() has already returned by the time the generator
+            # body runs, so its decorator no longer applies. Re-enter inference
+            # mode here to keep the lazy generation graph-free.
+            with torch.inference_mode():
+                yield from _crossfade_stream_chunks(_decoded_waveforms(), fade_n)
 
         return _chunks()
 
@@ -1913,6 +1930,53 @@ def _tokenize_with_nonverbal_tags(text: str, tokenizer) -> torch.Tensor:
             combined.extend(p)
         result = torch.tensor([combined], dtype=torch.long)
     return result
+
+
+def _crossfade_stream_chunks(waveforms, fade_samples: int):
+    """Seamlessly join successive decodes of a growing audio-token prefix.
+
+    Each item of ``waveforms`` is the full waveform decoded from all tokens
+    committed so far. Consecutive waveforms therefore cover the same absolute
+    sample range plus one new block. The last ``fade_samples`` samples of a
+    decode are withheld until the next decode arrives (which sees more future
+    context for that region) and the two versions are linearly cross-faded.
+    This removes the click produced by splicing two independent decoder runs.
+
+    Args:
+        waveforms: Iterable of 1-D float arrays whose length grows over time.
+        fade_samples: Overlap in samples; ``<= 0`` disables the cross-fade.
+
+    Yields:
+        1-D float32 arrays of newly available audio, in order.
+    """
+    prev = None
+    emitted = 0
+    for waveform in waveforms:
+        waveform = np.asarray(waveform, dtype=np.float32)
+        if prev is None:
+            cut = max(0, waveform.shape[-1] - fade_samples)
+            if cut > 0:
+                yield waveform[:cut]
+            prev, emitted = waveform, cut
+            continue
+
+        fade_end = min(prev.shape[-1], waveform.shape[-1])
+        if fade_end > emitted:
+            w_out = np.linspace(1.0, 0.0, fade_end - emitted, dtype=np.float32)
+            yield (
+                prev[emitted:fade_end] * w_out
+                + waveform[emitted:fade_end] * (1.0 - w_out)
+            )
+            emitted = fade_end
+
+        cut = max(emitted, waveform.shape[-1] - fade_samples)
+        if cut > emitted:
+            yield waveform[emitted:cut]
+            emitted = cut
+        prev = waveform
+
+    if prev is not None and prev.shape[-1] > emitted:
+        yield prev[emitted:]
 
 
 def _combine_text(text, ref_text: Optional[str] = None) -> str:
