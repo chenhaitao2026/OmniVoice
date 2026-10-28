@@ -342,7 +342,7 @@ def iter_realtime_blocks(
         gen_config.denoise,
         has_prompt,
     )
-    cond_parts = [style_ids, text_ids]
+    cond_parts = [style_ids.to(device), text_ids.to(device)]
     uncond_parts = []
     if has_prompt:
         prompt = ref_audio_tokens.unsqueeze(0).to(device=device, dtype=torch.long)
@@ -432,9 +432,13 @@ def iter_realtime_blocks(
             )
 
         block = tokens[0]
-        eos_frame = (block == eos_id).all(dim=0) | (block[0] == eos_id)
-        if bool(eos_frame.any()):
-            cut = int(eos_frame.nonzero()[0])
+        # EOS is trained as a full frame, but a partially-EOS frame can appear
+        # during sampling (e.g. channel 0 is speech, channel 3 is EOS). Feeding
+        # the EOS/mask ids to the audio tokenizer is out of range and crashes
+        # the CUDA context, so stop at the first column containing either.
+        stop_mask = (block == eos_id) | (block == mask_id)
+        if bool(stop_mask.any()):
+            cut = int(stop_mask.any(dim=0).nonzero()[0])
             if cut > 0:
                 speech = block[:, :cut]
                 produced += speech.shape[-1]

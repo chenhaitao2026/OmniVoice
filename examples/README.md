@@ -8,6 +8,7 @@ This directory contains scripts and configs for training, fine-tuning, and evalu
 | Fine-tuning | [run_finetune.sh](run_finetune.sh) | Fine-tune from a pretrained checkpoint using your own JSONL data |
 | LoRA fine-tuning | [run_finetune_lora.sh](run_finetune_lora.sh) | Parameter-efficient finetuning via PEFT LoRA adapters — see [../docs/lora_finetuning.md](../docs/lora_finetuning.md) |
 | Evaluation | [run_eval.sh](run_eval.sh) | Evaluate WER, speaker similarity, and UTMOS on standard test sets |
+| Realtime test | [test_luna_realtime_minimax.py](test_luna_realtime_minimax.py) | Test the Luna-TTS Realtime checkpoint on MiniMax zh/en with the local ASR service |
 
 ---
 
@@ -118,3 +119,27 @@ bash examples/run_eval.sh
 ```
 
 > See [docs/evaluation.md](../docs/evaluation.md) for metrics details, test set preparation, and running individual metrics.
+
+---
+
+## Realtime Checkpoint Test (MiniMax zh/en)
+
+[test_luna_realtime_minimax.py](test_luna_realtime_minimax.py) synthesizes the
+Chinese and English sentences of
+[MiniMaxAI/TTS-Multilingual-Test-Set](https://huggingface.co/datasets/MiniMaxAI/TTS-Multilingual-Test-Set)
+with a Luna-TTS Realtime checkpoint, transcribes each wav through the local
+OpenAI-compatible ASR service, and reports CER (zh) / WER (en).
+
+```bash
+# Full run: 99 Chinese + 99 English sentences, zero-shot cloning of both prompts
+python examples/test_luna_realtime_minimax.py
+
+# Quick check
+python examples/test_luna_realtime_minimax.py --limit 5
+```
+
+The script auto-detects the dataset under the Hugging Face cache
+(`/Cache/huggingface`) and the free GPU with the most memory. Override with
+`--dataset-root`, `--model`, `--device`, and `--asr-url`. Results are written to
+`results/luna_realtime_minimax/` (`results.jsonl`, `results.tsv`, `summary.json`,
+and per-sentence wavs).
