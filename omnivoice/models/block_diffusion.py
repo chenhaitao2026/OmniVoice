@@ -44,6 +44,10 @@ STREAM_PAD = -1
 # Minimum mask rate. The ELBO weight is 1/t, so t = 0 is undefined.
 MIN_MASK_T = 1e-3
 
+# Compiled realtime runners keyed by (model, device, shape). Keeping them alive
+# lets every request after the first reuse the same CUDA graph.
+_COMPILED_RUNNERS = {}
+
 
 def resize_audio_vocab(model, new_vocab_size: int) -> None:
     """Grow per-codebook audio embeddings and heads, preserving old rows.
@@ -286,19 +290,347 @@ def _tokenize_prefix(model, text, ref_text, lang, instruct, denoise, has_prompt)
     return style_ids, text_ids
 
 
-def _commit_schedule_step(tokens, pred_tokens, scores, k, mask_id, position_temperature):
+def _commit_schedule_step(
+    tokens,
+    pred_tokens,
+    scores,
+    k,
+    mask_id,
+    position_temperature,
+    remaining: Optional[int] = None,
+):
     from omnivoice.models.omnivoice import _gumbel_sample
 
     if position_temperature > 0.0:
         scores = _gumbel_sample(scores, position_temperature)
     scores = scores.masked_fill(tokens != mask_id, float("-inf"))
-    k = min(k, int((tokens == mask_id).sum().item()))
+    if remaining is None:
+        # Kept for callers that do not track the schedule; this forces a GPU
+        # sync, so the realtime loop passes the remaining count explicitly.
+        remaining = int((tokens == mask_id).sum().item())
+    k = min(k, remaining)
     if k <= 0:
         return tokens
     _, topk_idx = torch.topk(scores.flatten(), k)
     flat = tokens.flatten()
     flat[topk_idx] = pred_tokens.flatten()[topk_idx]
     return flat.view_as(tokens)
+
+
+class _SeparateCFGRunner:
+    """Baseline runner: one forward per condition stream (the original path)."""
+
+    def __init__(
+        self,
+        model,
+        *,
+        cond_prefix,
+        cond_audio,
+        uncond_prefix,
+        uncond_audio,
+        use_cfg: bool,
+        block_size: int,
+        device,
+    ):
+        from transformers.cache_utils import DynamicCache
+
+        self.model = model
+        self.block_size = block_size
+        self.use_cfg = use_cfg
+        self.audio_mask = torch.ones(1, block_size, dtype=torch.bool, device=device)
+
+        self.cond_cache = DynamicCache()
+        _, self.cond_cache = _forward_block(
+            model, cond_prefix, cond_audio, self.cond_cache, keep=True
+        )
+        self.uncond_cache = None
+        if use_cfg:
+            self.uncond_cache = DynamicCache()
+            if uncond_prefix.shape[-1] > 0:
+                _, self.uncond_cache = _forward_block(
+                    model, uncond_prefix, uncond_audio, self.uncond_cache, keep=True
+                )
+
+    def begin_block(self, _block_index: int) -> None:
+        pass
+
+    def step(self, tokens):
+        cond_logits, self.cond_cache = _forward_block(
+            self.model, tokens, self.audio_mask, self.cond_cache, keep=False
+        )
+        if self.use_cfg:
+            uncond_logits, self.uncond_cache = _forward_block(
+                self.model, tokens, self.audio_mask, self.uncond_cache, keep=False
+            )
+        else:
+            uncond_logits = cond_logits
+        return cond_logits, uncond_logits
+
+    def commit(self, tokens) -> None:
+        _, self.cond_cache = _forward_block(
+            self.model, tokens, self.audio_mask, self.cond_cache, keep=True
+        )
+        if self.use_cfg:
+            _, self.uncond_cache = _forward_block(
+                self.model, tokens, self.audio_mask, self.uncond_cache, keep=True
+            )
+
+
+class _BatchedCFGRunner:
+    """Run cond and uncond as one batch=2 forward on a preallocated cache.
+
+    Two things make this much faster than :class:`_SeparateCFGRunner`:
+
+    * CFG is one batch=2 forward instead of two batch=1 forwards. At these
+      sequence lengths the model is launch-bound, so batch=2 costs almost the
+      same as batch=1.
+    * ``torch.compile(mode="reduce-overhead")`` can capture the fixed-shape
+      step (including the KV cache writes) as a CUDA graph. The eager step
+      dispatches ~1.7k tiny kernels and leaves the GPU idle; graph replay
+      removes that overhead.
+
+    The two condition streams have different prefix lengths, so both are
+    right-padded to a common length and the real positions are passed
+    explicitly. Padded keys are masked out; RoPE uses the unpadded length.
+    """
+
+    def __init__(
+        self,
+        model,
+        *,
+        cond_prefix,
+        cond_audio,
+        uncond_prefix,
+        uncond_audio,
+        block_size: int,
+        max_blocks: int,
+        compile_steps: bool,
+        device,
+        prefix_len: Optional[int] = None,
+    ):
+        from transformers.cache_utils import StaticCache
+
+        channels = cond_prefix.shape[1]
+        natural_prefix = max(cond_prefix.shape[-1], uncond_prefix.shape[-1])
+        if prefix_len is None:
+            prefix_len = natural_prefix
+            if compile_steps:
+                # Bucket the prefix length so a whole evaluation run only builds
+                # a handful of CUDA graphs, instead of one per sentence.
+                prefix_len = max(256, math.ceil(prefix_len / 256) * 256)
+        if natural_prefix > prefix_len:
+            raise ValueError(
+                f"prefix_len={prefix_len} cannot hold {natural_prefix} tokens."
+            )
+        self.prefix_len = prefix_len
+        self.lc = cond_prefix.shape[-1]
+        self.lu = uncond_prefix.shape[-1]
+        self.block_size = block_size
+        self.model = model
+        self.compiled = bool(compile_steps)
+        self._warmed = False
+
+        max_cache_len = prefix_len + max_blocks * block_size + block_size
+        self.cache = StaticCache(
+            config=model.llm.config,
+            max_cache_len=max_cache_len,
+            max_batch_size=2,
+        )
+        self.ids = torch.zeros(2, channels, prefix_len, dtype=torch.long, device=device)
+        self.audio = torch.zeros(2, prefix_len, dtype=torch.bool, device=device)
+
+        mask_dtype = next(model.parameters()).dtype
+        neg = torch.finfo(mask_dtype).min
+        self.neg = neg
+        self.prefill_mask = torch.empty(
+            (2, 1, prefix_len, max_cache_len),
+            dtype=mask_dtype,
+            device=device,
+        )
+        self.prefill_pos = torch.zeros(2, prefix_len, dtype=torch.long, device=device)
+        self.prefill_cache_position = torch.arange(prefix_len, device=device)
+        self._refresh_prefix(cond_prefix, cond_audio, uncond_prefix, uncond_audio)
+
+        # Fixed buffers for every denoising step. Values are refreshed in
+        # begin_block(); shapes never change so the graph is captured once.
+        self.step_ids = torch.full(
+            (2, channels, block_size),
+            model.config.audio_mask_id,
+            dtype=torch.long,
+            device=device,
+        )
+        self.step_audio = torch.ones(2, block_size, dtype=torch.bool, device=device)
+        self.step_mask = torch.full(
+            (2, 1, block_size, max_cache_len),
+            neg,
+            dtype=mask_dtype,
+            device=device,
+        )
+        self.step_pos = torch.zeros(2, block_size, dtype=torch.long, device=device)
+        self.cache_position = torch.zeros(block_size, dtype=torch.long, device=device)
+
+        self._step_fn = self._eager_step
+        if compile_steps:
+            try:
+                self._step_fn = torch.compile(
+                    self._eager_step, mode="reduce-overhead", fullgraph=False
+                )
+            except Exception as exc:  # pragma: no cover - depends on torch build
+                logger.warning("torch.compile setup failed (%s); using eager.", exc)
+                self.compiled = False
+
+    def _refresh_prefix(
+        self, cond_prefix, cond_audio, uncond_prefix, uncond_audio
+    ) -> None:
+        """Reset the cache and prefill a new request into the static buffers."""
+        lc = cond_prefix.shape[-1]
+        lu = uncond_prefix.shape[-1]
+        if lc > self.prefix_len or lu > self.prefix_len:
+            raise ValueError("Request prefix exceeds the runner's allocated prefix.")
+        self.lc = lc
+        self.lu = lu
+        self.cache.reset()
+        self.ids.zero_()
+        self.ids[0, :, :lc] = cond_prefix[0]
+        self.ids[1, :, :lu] = uncond_prefix[0]
+        self.audio.zero_()
+        self.audio[0, :lc] = cond_audio[0]
+        self.audio[1, :lu] = uncond_audio[0]
+        self.prefill_mask.fill_(self.neg)
+        self.prefill_mask[0, :, :, :lc] = 0
+        self.prefill_mask[1, :, :, :lu] = 0
+        if lu == 0:
+            # Keep at least one key visible for the pad queries, otherwise SDPA
+            # produces NaN rows that can leak into later attention.
+            self.prefill_mask[1, :, :, 0] = 0
+        self.prefill_pos.zero_()
+        self.prefill_pos[0, :lc] = torch.arange(lc, device=self.ids.device)
+        self.prefill_pos[1, :lu] = torch.arange(lu, device=self.ids.device)
+        with torch.no_grad():
+            self.model(
+                input_ids=self.ids,
+                audio_mask=self.audio,
+                attention_mask=self.prefill_mask,
+                position_ids=self.prefill_pos,
+                past_key_values=self.cache,
+                use_cache=True,
+                cache_position=self.prefill_cache_position,
+            )
+
+    def reset(self, cond_prefix, cond_audio, uncond_prefix, uncond_audio) -> None:
+        """Reuse this runner (and its captured graph) for another request."""
+        self._refresh_prefix(cond_prefix, cond_audio, uncond_prefix, uncond_audio)
+
+    def _eager_step(self):
+        return self.model(
+            input_ids=self.step_ids,
+            audio_mask=self.step_audio,
+            attention_mask=self.step_mask,
+            position_ids=self.step_pos,
+            past_key_values=self.cache,
+            use_cache=True,
+            cache_position=self.cache_position,
+        ).logits
+
+    def _run(self):
+        if self.compiled:
+            # Required by reduce-overhead: the previous replay's output tensor
+            # is reused by the next replay.
+            torch.compiler.cudagraph_mark_step_begin()
+        return self._step_fn()
+
+    def begin_block(self, block_index: int) -> None:
+        end = self.prefix_len + block_index * self.block_size
+        stop = end + self.block_size
+        self.step_mask.fill_(self.neg)
+        self.step_mask[0, :, :, : self.lc] = 0
+        self.step_mask[1, :, :, : self.lu] = 0
+        # Previously committed target blocks are stored contiguously at
+        # [prefix_len, end); include them along with the active block.
+        self.step_mask[0, :, :, self.prefix_len : stop] = 0
+        self.step_mask[1, :, :, self.prefix_len : stop] = 0
+        q = self.block_size
+        self.step_pos[0] = (
+            self.lc + block_index * q + torch.arange(q, device=self.step_pos.device)
+        )
+        self.step_pos[1] = (
+            self.lu + block_index * q + torch.arange(q, device=self.step_pos.device)
+        )
+        self.cache_position[:] = torch.arange(
+            end, stop, device=self.cache_position.device
+        )
+
+    def _fill_tokens(self, tokens) -> None:
+        self.step_ids[0] = tokens[0]
+        self.step_ids[1] = tokens[0]
+
+    def step(self, tokens):
+        self._fill_tokens(tokens)
+        if self.compiled and not self._warmed:
+            # Compile/capture once, before the timed part of the first block.
+            try:
+                self._run()
+            except Exception as exc:  # pragma: no cover - depends on torch build
+                logger.warning("torch.compile failed (%s); using eager.", exc)
+                self.compiled = False
+                self._step_fn = self._eager_step
+            self._warmed = True
+        logits = self._run()
+        return logits[0:1], logits[1:2]
+
+    def commit(self, tokens) -> None:
+        self._fill_tokens(tokens)
+        self._run()
+
+
+def _get_compiled_runner(
+    model,
+    *,
+    cond_prefix,
+    cond_audio,
+    uncond_prefix,
+    uncond_audio,
+    block_size: int,
+    max_blocks: int,
+    device,
+):
+    """Reuse one compiled runner per (device, shape, duration cap).
+
+    ``torch.compile`` specializes on shapes, and creating a fresh runner per
+    sentence would pay the compile/capture cost every time. The static buffers
+    are request-independent, so a cached runner is reset and re-prefilled.
+    """
+    natural = max(cond_prefix.shape[-1], uncond_prefix.shape[-1])
+    prefix_len = max(256, math.ceil(natural / 256) * 256)
+    key = (
+        model,
+        str(device),
+        block_size,
+        max_blocks,
+        prefix_len,
+        str(next(model.parameters()).dtype),
+    )
+    runner = _COMPILED_RUNNERS.get(key)
+    if runner is None:
+        runner = _BatchedCFGRunner(
+            model,
+            cond_prefix=cond_prefix,
+            cond_audio=cond_audio,
+            uncond_prefix=uncond_prefix,
+            uncond_audio=uncond_audio,
+            block_size=block_size,
+            max_blocks=max_blocks,
+            compile_steps=True,
+            device=device,
+            prefix_len=prefix_len,
+        )
+        _COMPILED_RUNNERS[key] = runner
+        # Keep memory bounded when a process sees many duration caps/shapes.
+        while len(_COMPILED_RUNNERS) > 4:
+            _COMPILED_RUNNERS.pop(next(iter(_COMPILED_RUNNERS)))
+    else:
+        runner.reset(cond_prefix, cond_audio, uncond_prefix, uncond_audio)
+    return runner
 
 
 def iter_realtime_blocks(
@@ -317,8 +649,6 @@ def iter_realtime_blocks(
 
     Stops on the learned EOS frame or on ``max_duration``, whichever comes first.
     """
-    from transformers.cache_utils import DynamicCache
-
     block_size = int(getattr(model.config, "block_size", 0) or 0)
     eos_id = getattr(model.config, "audio_eos_id", None)
     if block_size <= 0 or eos_id is None:
@@ -349,59 +679,80 @@ def iter_realtime_blocks(
         cond_parts.append(prompt)
         uncond_parts.append(prompt)
     cond_prefix = torch.cat(cond_parts, dim=2).to(device)
-    cond_audio = torch.zeros(
-        1, cond_prefix.shape[-1], dtype=torch.bool, device=device
-    )
+    cond_audio = torch.zeros(1, cond_prefix.shape[-1], dtype=torch.bool, device=device)
     # Style and text occupy the non-audio prefix; prompt, if any, is the tail.
     prompt_len = ref_audio_tokens.shape[-1] if has_prompt else 0
     if prompt_len:
         cond_audio[0, -prompt_len:] = True
 
-    cond_cache = DynamicCache()
-    _, cond_cache = _forward_block(
-        model, cond_prefix, cond_audio, cond_cache, keep=True
-    )
-
     use_cfg = gen_config.guidance_scale != 0
-    uncond_cache = None
-    if use_cfg:
-        uncond_cache = DynamicCache()
-        if uncond_parts:
-            uncond_prefix = torch.cat(uncond_parts, dim=2).to(device)
-            uncond_audio = torch.ones(
-                1, uncond_prefix.shape[-1], dtype=torch.bool, device=device
-            )
-            _, uncond_cache = _forward_block(
-                model, uncond_prefix, uncond_audio, uncond_cache, keep=True
-            )
+    if uncond_parts:
+        uncond_prefix = torch.cat(uncond_parts, dim=2).to(device)
+        uncond_audio = torch.ones(
+            1, uncond_prefix.shape[-1], dtype=torch.bool, device=device
+        )
+    else:
+        uncond_prefix = torch.empty(1, channels, 0, dtype=torch.long, device=device)
+        uncond_audio = torch.empty(1, 0, dtype=torch.bool, device=device)
 
     max_frames = max(block_size, int(max_duration * frame_rate))
     max_blocks = math.ceil(max_frames / block_size)
+
+    batch_cfg = bool(getattr(gen_config, "realtime_batch_cfg", True))
+    compile_steps = bool(getattr(gen_config, "realtime_compile", False))
+    if use_cfg and batch_cfg:
+        if compile_steps:
+            runner = _get_compiled_runner(
+                model,
+                cond_prefix=cond_prefix,
+                cond_audio=cond_audio,
+                uncond_prefix=uncond_prefix,
+                uncond_audio=uncond_audio,
+                block_size=block_size,
+                max_blocks=max_blocks,
+                device=device,
+            )
+        else:
+            runner = _BatchedCFGRunner(
+                model,
+                cond_prefix=cond_prefix,
+                cond_audio=cond_audio,
+                uncond_prefix=uncond_prefix,
+                uncond_audio=uncond_audio,
+                block_size=block_size,
+                max_blocks=max_blocks,
+                compile_steps=False,
+                device=device,
+            )
+    else:
+        runner = _SeparateCFGRunner(
+            model,
+            cond_prefix=cond_prefix,
+            cond_audio=cond_audio,
+            uncond_prefix=uncond_prefix,
+            uncond_audio=uncond_audio,
+            use_cfg=use_cfg,
+            block_size=block_size,
+            device=device,
+        )
+
     produced = 0
     layer_ids = torch.arange(channels, device=device).view(1, -1, 1)
     positions = block_size * channels
+    counts = _unmask_counts(positions, gen_config.num_step, gen_config.t_shift, device)
 
-    for _ in range(max_blocks):
+    for block_index in range(max_blocks):
         tokens = torch.full(
             (1, channels, block_size),
             mask_id,
             dtype=torch.long,
             device=device,
         )
-        audio_mask = torch.ones(1, block_size, dtype=torch.bool, device=device)
-        counts = _unmask_counts(
-            positions, gen_config.num_step, gen_config.t_shift, device
-        )
+        runner.begin_block(block_index)
+        remaining = positions
         for step, k in enumerate(counts):
-            cond_logits, cond_cache = _forward_block(
-                model, tokens, audio_mask, cond_cache, keep=False
-            )
-            if use_cfg:
-                uncond_logits, uncond_cache = _forward_block(
-                    model, tokens, audio_mask, uncond_cache, keep=False
-                )
-            else:
-                uncond_logits = cond_logits
+            k = min(k, remaining)
+            cond_logits, uncond_logits = runner.step(tokens)
             pred, scores = model._predict_tokens_with_scoring(
                 cond_logits[:, :, :block_size],
                 uncond_logits[:, :, :block_size],
@@ -415,21 +766,17 @@ def iter_realtime_blocks(
                 k,
                 mask_id,
                 gen_config.position_temperature,
+                remaining=remaining,
             )
+            remaining -= k
             if step == gen_config.num_step - 1:
                 # The last step of the cosine schedule commits every remaining
                 # mask. Force anything still masked (numerical ties) to the argmax.
                 still = tokens == mask_id
                 tokens = torch.where(still, pred, tokens)
 
-        # Commit the clean block into both caches before reading the next one.
-        _, cond_cache = _forward_block(
-            model, tokens, audio_mask, cond_cache, keep=True
-        )
-        if use_cfg:
-            _, uncond_cache = _forward_block(
-                model, tokens, audio_mask, uncond_cache, keep=True
-            )
+        # Commit the clean block into the cache before reading the next one.
+        runner.commit(tokens)
 
         block = tokens[0]
         # EOS is trained as a full frame, but a partially-EOS frame can appear

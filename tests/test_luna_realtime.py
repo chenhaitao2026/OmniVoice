@@ -17,6 +17,7 @@ from omnivoice.models.block_diffusion import (
     CONTEXT_BLOCK_ID,
     STREAM_CLEAN,
     STREAM_NOISY,
+    _BatchedCFGRunner,
     build_block_attention_mask,
     iter_realtime_blocks,
     resize_audio_vocab,
@@ -211,6 +212,36 @@ class RealtimeSmokeTest(unittest.TestCase):
                 self.assertEqual(blocks[0].shape[0], 2)
                 self.assertLessEqual(blocks[0].shape[1], 4)
                 self.assertFalse(torch.isin(blocks[0], torch.tensor(15)).any())
+
+    def test_batched_cfg_attends_to_committed_blocks(self):
+        model = _tiny_model(vocab=16, mask_id=14, codebooks=2)
+        model.config.block_size = 4
+        model.config.audio_eos_id = 15
+        channels, lc, lu, block = 2, 6, 3, 4
+        cond = torch.randint(0, 10, (1, channels, lc))
+        uncond = torch.randint(0, 10, (1, channels, lu))
+        runner = _BatchedCFGRunner(
+            model,
+            cond_prefix=cond,
+            cond_audio=torch.ones(1, lc, dtype=torch.bool),
+            uncond_prefix=uncond,
+            uncond_audio=torch.ones(1, lu, dtype=torch.bool),
+            block_size=block,
+            max_blocks=3,
+            compile_steps=False,
+            device=torch.device("cpu"),
+        )
+        runner.begin_block(1)
+        visible_cond = runner.step_mask[0, 0] == 0
+        # Prefix and both committed blocks (block 0 + active block 1) are visible.
+        self.assertTrue(visible_cond[:, :lc].all())
+        self.assertTrue(visible_cond[:, lc : lc + 2 * block].all())
+        self.assertFalse(visible_cond[:, lc + 2 * block :].any())
+        # The uncond row must not see its right-padding between lu and lc.
+        visible_uncond = runner.step_mask[1, 0] == 0
+        self.assertTrue(visible_uncond[:, :lu].all())
+        self.assertFalse(visible_uncond[:, lu:lc].any())
+        self.assertTrue(visible_uncond[:, lc : lc + 2 * block].all())
 
     def test_stream_crossfade_removes_block_seam(self):
         import numpy as np

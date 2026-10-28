@@ -136,7 +136,13 @@ python examples/test_luna_realtime_minimax.py
 
 # Quick check
 python examples/test_luna_realtime_minimax.py --limit 5
+
+# Fast path: batch the CFG streams and capture each step as a CUDA graph
+python examples/test_luna_realtime_minimax.py --limit 5 --realtime-compile
 ```
+
+The first sample with `--realtime-compile` includes a one-off compile/capture
+cost; later samples reuse the graph (prefix lengths are bucketed).
 
 The script auto-detects the dataset under the Hugging Face cache
 (`/Cache/huggingface`) and the free GPU with the most memory. Override with

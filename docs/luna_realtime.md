@@ -91,3 +91,61 @@ for chunk in model.generate_realtime(text="...", ref_audio="ref.wav", ref_text="
 Do not point it at a realtime checkpoint if you want the streaming schedule;
 the weights can still run that path, but they were adapted for block-causal
 attention.
+
+## Inference performance
+
+Three decoding paths are available:
+
+* **Separate CFG** (`realtime_batch_cfg=False`): the original sampler, one
+  forward per condition stream.
+* **Batched CFG** (default): `cond` and `uncond` run as one `batch=2` forward on
+  a preallocated `StaticCache`. A 32-frame step is kernel-launch bound, so
+  batch=2 costs essentially the same as batch=1 and roughly halves the wall
+  time.
+* **Batched CFG + CUDA graph** (`realtime_compile=True`, or
+  `--realtime_compile`): each denoising step (including the KV-cache writes) is
+  captured with `torch.compile(mode="reduce-overhead")`. Replay removes the
+  ~1.7k tiny kernel launches that leave the GPU idle in eager mode. The first
+  request pays a one-off compile (tens of seconds on a cold Inductor cache);
+  later requests reuse the graph. Prefix lengths are bucketed to 256 tokens so
+  a serving process builds only a handful of graphs.
+
+```python
+for chunk in model.generate_realtime(
+    text="...", ref_audio="ref.wav", ref_text="...",
+    stream=True, realtime_compile=True,
+):
+    play(chunk)
+```
+
+Measured on one A100, fp16, single stream, `max_duration=30`, 8 steps per
+block, 30 Chinese + 30 English sentences, including reference-audio encoding,
+prefill, codec decode and streaming cross-fade. The compile time of the first
+request is excluded:
+
+| mode | RTF | TTFC |
+|---|---|---|
+| separate CFG (old) | 0.55–0.57 | 0.81 s |
+| batched CFG | 0.28–0.30 | 0.43–0.48 s |
+| batched CFG + CUDA graph | 0.07–0.08 | 0.17–0.19 s |
+
+CFG batching changes the fp16 reduction order, so output is not bit-identical
+to the unbatched sampler; CER/WER is unchanged within evaluation noise. After
+the incremental decode below, the remaining costs are the one-off prefill
+(TTFC) and the per-block Transformer step.
+
+### Incremental codec decode
+
+The DAC codec decoder is local: re-decoding a fixed window of
+`stream_decode_context` seconds (default 2.56 s) with each new block produces
+the same waveform as re-decoding the whole utterance, at ~58–61 dB SNR, while
+turning streaming decode from O(T²) into O(T). On a 20 s utterance the
+end-to-end RTF drops from 0.077 (cumulative decode) to 0.061. Set
+`stream_decode_context=0` to restore the old cumulative decode.
+
+The remaining single-stream cost is the per-block Transformer step: roughly
+5 ms per denoising step on an A100, i.e. ~0.03 RTF for the denoiser alone.
+Getting to the low-0.02 range on one stream needs either a more efficient
+long-context attention (the dense block mask makes the SDPA kernel inefficient
+at 32 queries) or batching several streams; on H100 / batch≥2 the same path is
+well below 0.024.

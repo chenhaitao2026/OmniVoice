@@ -103,6 +103,12 @@ def get_parser() -> argparse.ArgumentParser:
         help="Maximum generated duration in seconds for --realtime. "
         "Generation still stops early on the learned EOS token.",
     )
+    parser.add_argument(
+        "--realtime_compile",
+        action="store_true",
+        help="Capture each realtime denoising step as a CUDA graph. "
+        "Much lower per-block latency after a one-off compile cost.",
+    )
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument(
         "--duration",
@@ -171,6 +177,7 @@ def main():
             "Realtime mode: block-causal generation, max_duration=%.1fs",
             args.duration if args.duration is not None else args.max_duration,
         )
+        gen_kwargs["realtime_compile"] = args.realtime_compile
         audios = model.generate_realtime(
             **gen_kwargs,
             max_duration=args.duration

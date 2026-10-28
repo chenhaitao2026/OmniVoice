@@ -190,6 +190,17 @@ class OmniVoiceGenerationConfig:
     # Streaming only: overlap kept between consecutive block decodes and
     # cross-faded, so the block seam is not an abrupt splice.
     stream_crossfade_duration: float = 0.08
+    # Left context (seconds) re-decoded with each new block. A fixed window
+    # makes streaming decode O(T) instead of re-decoding the whole prefix every
+    # block; 0 falls back to the cumulative re-decode.
+    stream_decode_context: float = 2.56
+    # Realtime decoding. With guidance_scale != 0 the two CFG streams are
+    # batched into one forward by default (same GPU cost as one stream at these
+    # sequence lengths). realtime_compile additionally captures each denoising
+    # step as a CUDA graph via torch.compile; the first call pays a one-off
+    # compile cost, later blocks replay in well under a millisecond.
+    realtime_batch_cfg: bool = True
+    realtime_compile: bool = False
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -821,7 +832,13 @@ class OmniVoice(PreTrainedModel):
             **kwargs: Same decoding fields as :meth:`generate`. ``num_step``
                 defaults to ``config.block_steps`` (8) rather than 32. Set
                 ``stream_crossfade_duration`` (seconds, default 0.08) to tune
-                the streaming overlap; 0 disables it.
+                the streaming overlap; 0 disables it. ``realtime_batch_cfg``
+                (default True) runs the two CFG streams as one batch=2 forward;
+                ``realtime_compile`` (default False) captures each denoising
+                step as a CUDA graph, which trades a one-off compile cost for
+                much lower per-block latency. ``stream_decode_context``
+                (seconds, default 2.56) is the left context re-decoded with
+                each streamed block; 0 re-decodes the whole prefix.
         """
         if self.text_tokenizer is None:
             raise RuntimeError(
@@ -910,8 +927,29 @@ class OmniVoice(PreTrainedModel):
             )
 
         committed = []
+        frames = 0
+        state = {"cum": None, "cut": 0}
+        hop = int(round(self.sampling_rate / frame_rate))
+        context = float(getattr(gen_config, "stream_decode_context", 0.0))
+        window_frames = int(round(context * frame_rate)) if context > 0 else 0
+        # The codec decoder is non-causal: the same frame is decoded with much
+        # less future context at the end of one call than in the next call.
+        # Holding back a short overlap and cross-fading removes the splice.
+        fade_n = int(gen_config.stream_crossfade_duration * self.sampling_rate)
+
+        def _decode(tokens):
+            return (
+                self.audio_tokenizer.decode(
+                    tokens.to(self.audio_tokenizer.device).unsqueeze(0)
+                )
+                .audio_values[0]
+                .cpu()
+                .numpy()
+                .squeeze()
+            )
 
         def _decoded_waveforms():
+            nonlocal frames
             for block in iter_realtime_blocks(
                 self,
                 text=task.texts[index],
@@ -924,21 +962,27 @@ class OmniVoice(PreTrainedModel):
                 frame_rate=frame_rate,
             ):
                 committed.append(block)
-                tokens = torch.cat(committed, dim=-1)
-                yield (
-                    self.audio_tokenizer.decode(
-                        tokens.to(self.audio_tokenizer.device).unsqueeze(0)
-                    )
-                    .audio_values[0]
-                    .cpu()
-                    .numpy()
-                    .squeeze()
-                )
-
-        # The codec decoder is non-causal: the same frame is decoded with much
-        # less future context at the end of one call than in the next call.
-        # Holding back a short overlap and cross-fading removes the splice.
-        fade_n = int(gen_config.stream_crossfade_duration * self.sampling_rate)
+                frames += block.shape[-1]
+                end = frames
+                all_tokens = torch.cat(committed, dim=-1)
+                if window_frames <= 0:
+                    yield _decode(all_tokens)
+                    continue
+                start = max(0, end - window_frames)
+                if state["cum"] is not None:
+                    # The decoder sees no future context, so the last frames of
+                    # a call are revised by the next one. Extend the window far
+                    # enough left to cover the withheld cross-fade tail.
+                    start = min(start, state["cut"] // hop)
+                wave = _decode(all_tokens[:, start:end])
+                if state["cum"] is None:
+                    cum = wave
+                else:
+                    cut = state["cut"]
+                    cum = np.concatenate([state["cum"][:cut], wave[cut - start * hop :]])
+                state["cut"] = max(state["cut"], end * hop - fade_n)
+                state["cum"] = cum
+                yield cum
 
         def _chunks():
             # generate_realtime() has already returned by the time the generator

@@ -361,6 +361,8 @@ def synthesize(
         t_shift=args.t_shift,
         denoise=args.denoise,
         postprocess_output=args.postprocess_output,
+        realtime_compile=args.realtime_compile,
+        realtime_batch_cfg=args.realtime_batch_cfg,
     )
     if args.num_step is not None:
         gen_kwargs["num_step"] = args.num_step
@@ -556,6 +558,20 @@ def get_parser() -> argparse.ArgumentParser:
         help="Commit blocks internally but decode the whole utterance at the end.",
     )
     parser.add_argument("--max-duration", type=float, default=30.0)
+    parser.add_argument(
+        "--realtime-compile",
+        action="store_true",
+        help="Capture each realtime denoising step as a CUDA graph. The first "
+        "block of a new shape pays a one-off compile cost; later blocks replay "
+        "in well under a millisecond.",
+    )
+    parser.add_argument(
+        "--no-realtime-batch-cfg",
+        dest="realtime_batch_cfg",
+        action="store_false",
+        default=True,
+        help="Disable batching the cond/uncond CFG streams into one forward.",
+    )
     parser.add_argument(
         "--num-step",
         type=int,
